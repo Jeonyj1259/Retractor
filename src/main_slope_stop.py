@@ -4,9 +4,9 @@ Robotus F/T 센서를 고주파수(TARGET_FS)로 읽으면서
 Fz에 EMA 저역통과 필터를 적용하고,
 윈도우 기반 dFz/dt(slope)가 어떤 임계값을 넘으면
 
-1) Zaber 속도 이동을 stop()
-2) 정지 당시 현재 위치를 읽고
-3) 실험 시작 당시 Zaber 위치로 복귀(move abs)
+1) Zaber 2개의 속도 이동을 stop()
+2) 정지 당시 각 Zaber의 현재 위치를 읽고
+3) 실험 시작 당시 각 Zaber 위치로 복귀(move abs)
 4) Robotus/플롯/CSV/PNG 정리 후 종료
 
 까지 자동으로 수행하는 스크립트.
@@ -34,15 +34,18 @@ from zaber_control import ZaberStage
 
 
 # ========= 사용자 설정 =========
-PORT_RFT   = "COM7"   # Robotus F/T 센서 포트
-PORT_ZABER = "COM8"   # Zaber 스테이지 포트
+PORT_RFT      = "COM5"   # Robotus F/T 센서 포트
+
+# ✅ Zaber 2개 포트 (노트북/데스크탑마다 실제 포트 번호 맞게 수정)
+PORT_ZABER_1  = "COM6"   # 첫 번째 Zaber
+PORT_ZABER_2  = "COM7"   # 두 번째 Zaber (없으면 "" 로 두거나 사용 안 함)
 
 TARGET_FS = 1000.0    # 목표 샘플링 주파수 [Hz]
 DT = 1.0 / TARGET_FS
 
 AXIS_FOR_SLOPE = "fz"     # slope 기준 축 (지금은 Fz)
-TARGET_SLOPE   = 200.0    # [N/s] 윈도우 기반 dFz/dt 임계값 (그래프 보고 조정)
-MIN_TIME_FOR_TRIGGER = 0.05   # 계측 시작 후 너무 초반 스파이크는 무시 [s]
+TARGET_SLOPE   = 550.0    # [N/s] 윈도우 기반 dFz/dt 임계값 (그래프 보고 조정)
+MIN_TIME_FOR_TRIGGER = 0.1   # 계측 시작 후 너무 초반 스파이크는 무시 [s]
 
 # EMA 필터 시간 상수 (신호 부드럽게 정도)
 TAU = 0.03  # [s] 0.02 ~ 0.05 사이에서 조정 추천 (값이 클수록 더 부드러움)
@@ -54,7 +57,7 @@ FZ_MIN_FOR_SLOPE = 0.05  # [N] 이 force 이상일 때만 slope 트리거 체크
 # Zaber 관련
 ZABER_USE = True              # 실험에서 Zaber 실제로 쓸 때만 True
 MICROSTEP_UM = 0.49609375     # [µm/step] (스테이지 스펙에서 가져온 값)
-DESIRED_SPEED_MM_S = -5.0     # [mm/s] -방향으로 5 mm/s
+DESIRED_SPEED_MM_S = -5.0     # [mm/s] -방향으로 5 mm/s  → 둘 다 동일 속도 사용
 
 # mm/s -> native 속도 (step/s) 변환
 ZABER_VEL_NATIVE = int(DESIRED_SPEED_MM_S / (MICROSTEP_UM / 1000.0))
@@ -87,8 +90,11 @@ target_reached = False
 # 저장 경로
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-SAVE_DIR    = os.path.join(PROJECT_DIR, f"rft_slope_{timestamp}")
+SAVE_DIR    = os.path.join(RESULTS_DIR, f"rft_slope_{timestamp}")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 CSV_PATH = os.path.join(SAVE_DIR, f"rft_slope_{timestamp}.csv")
@@ -123,11 +129,11 @@ def init_robotus() -> RFTseries:
     return rft
 
 
-def acquisition_loop(rft: RFTseries, zaber: ZaberStage | None):
+def acquisition_loop(rft: RFTseries, zabers: list[ZaberStage]):
     """
     고주파수(TARGET_FS)로 Robotus에서 데이터를 읽고,
     Fz에 EMA 필터 적용 + 윈도우 기반 dFz/dt 계산 + slope 임계값 체크.
-    임계값을 넘으면 Zaber를 stop() 하고 루프 종료.
+    임계값을 넘으면 모든 Zaber를 stop() 하고 루프 종료.
     """
     global running, target_reached
 
@@ -201,13 +207,13 @@ def acquisition_loop(rft: RFTseries, zaber: ZaberStage | None):
             target_reached = True
             running = False
 
-            # 여기서 바로 Zaber 정지 (추가 안전)
-            if zaber is not None:
+            # 여기서 바로 모든 Zaber 정지 (추가 안전)
+            for i, zb in enumerate(zabers):
                 try:
-                    zaber.stop()
-                    print("[Acq] Zaber stop() called due to slope trigger.")
+                    zb.stop()
+                    print(f"[Acq] Zaber[{i}] stop() called due to slope trigger.")
                 except Exception as e:
-                    print(f"[Acq] Zaber stop() failed: {e}")
+                    print(f"[Acq] Zaber[{i}] stop() failed: {e}")
             break
 
         # 6) 타이밍 맞추기 (고주파수 루프)
@@ -223,13 +229,13 @@ def acquisition_loop(rft: RFTseries, zaber: ZaberStage | None):
 
 def save_and_cleanup(
     rft: RFTseries | None,
-    zaber: ZaberStage | None,
+    zabers: list[ZaberStage],
     reason: str = "",
-    zaber_start_pos: int | None = None,
+    zaber_start_pos_list: list[int | None] | None = None,
 ):
     """
-    센서 정지, Zaber 정지 및 시작 위치 복귀, CSV/그림 저장, 리소스 반환.
-    정지 시점의 현재 위치와 시작 위치를 모두 로그로 남긴다.
+    센서 정지, 모든 Zaber 정지 및 시작 위치 복귀, CSV/그림 저장, 리소스 반환.
+    각 Zaber에 대해 정지 시점의 현재 위치와 시작 위치를 모두 로그로 남긴다.
     """
     global running
     running = False
@@ -237,44 +243,51 @@ def save_and_cleanup(
     print(f"[Cleanup] reason = {reason}")
 
     # Zaber 안전 정지 및 시작 위치 복귀
-    if zaber is not None:
-        # 0) 정지 시점 current pos 읽어보기 (디버깅용)
-        current_pos = None
-        try:
-            current_pos = zaber.get_position()
-            # mm 단위로도 로그
-            step_mm = MICROSTEP_UM / 1000.0
-            cur_mm = current_pos * step_mm
-            print(f"[Cleanup] Zaber current pos (native) = {current_pos} (~ {cur_mm:.3f} mm)")
-        except Exception as e:
-            print(f"[WARN] Zaber get_position in cleanup failed: {e}")
+    if zabers:
+        step_mm = MICROSTEP_UM / 1000.0
 
-        # 1) 속도 모드 정지
-        try:
-            zaber.stop()
-        except Exception as e:
-            print(f"[WARN] Zaber stop in cleanup failed: {e}")
+        for idx, zb in enumerate(zabers):
+            start_pos = None
+            if zaber_start_pos_list is not None and idx < len(zaber_start_pos_list):
+                start_pos = zaber_start_pos_list[idx]
 
-        # 2) 시작 위치 정보가 있으면 그 위치로 복귀
-        if zaber_start_pos is not None:
+            # 0) 정지 시점 current pos 읽어보기 (디버깅용)
             try:
-                step_mm = MICROSTEP_UM / 1000.0
-                start_mm = zaber_start_pos * step_mm
+                current_pos = zb.get_position()
+                cur_mm = current_pos * step_mm
                 print(
-                    f"[Cleanup] Returning Zaber to start pos "
-                    f"(native={zaber_start_pos}, ~{start_mm:.3f} mm)"
+                    f"[Cleanup] Zaber[{idx}] current pos (native) = {current_pos} "
+                    f"(~ {cur_mm:.3f} mm)"
                 )
-                zaber.move_abs_native(zaber_start_pos)
             except Exception as e:
-                print(f"[WARN] Zaber move_abs_native failed: {e}")
-        else:
-            print("[Cleanup] zaber_start_pos is None → 복귀 명령 생략.")
+                print(f"[WARN] Zaber[{idx}] get_position in cleanup failed: {e}")
+                current_pos = None
 
-        # 3) 시리얼 포트 닫기
-        try:
-            zaber.close()
-        except Exception as e:
-            print(f"[WARN] Zaber close failed: {e}")
+            # 1) 속도 모드 정지
+            try:
+                zb.stop()
+            except Exception as e:
+                print(f"[WARN] Zaber[{idx}] stop in cleanup failed: {e}")
+
+            # 2) 시작 위치 정보가 있으면 그 위치로 복귀
+            if start_pos is not None:
+                try:
+                    start_mm = start_pos * step_mm
+                    print(
+                        f"[Cleanup] Returning Zaber[{idx}] to start pos "
+                        f"(native={start_pos}, ~{start_mm:.3f} mm)"
+                    )
+                    zb.move_abs_native(start_pos)
+                except Exception as e:
+                    print(f"[WARN] Zaber[{idx}] move_abs_native failed: {e}")
+            else:
+                print(f"[Cleanup] Zaber[{idx}] start_pos is None → 복귀 명령 생략.")
+
+            # 3) 시리얼 포트 닫기
+            try:
+                zb.close()
+            except Exception as e:
+                print(f"[WARN] Zaber[{idx}] close failed: {e}")
 
     # Robotus 정지 및 close
     if rft is not None:
@@ -312,46 +325,68 @@ def save_and_cleanup(
 def main():
     global running, target_reached
 
-    # Zaber 초기화 및 시작 위치 읽기
-    zaber = None
-    zaber_start_pos: int | None = None
+    # Zaber 2개 초기화 및 시작 위치 읽기
+    zabers: list[ZaberStage] = []
+    zaber_start_pos_list: list[int | None] = []
 
     if ZABER_USE:
-        try:
-            zaber = ZaberStage(PORT_ZABER)
+        # 1번 Zaber
+        if PORT_ZABER_1:
             try:
-                zaber_start_pos = zaber.get_position()
-                step_mm = MICROSTEP_UM / 1000.0
-                start_mm = zaber_start_pos * step_mm
-                print(
-                    f"[Main] Zaber start position (native) = {zaber_start_pos} "
-                    f"(~ {start_mm:.3f} mm)"
-                )
+                zb1 = ZaberStage(PORT_ZABER_1)
+                zabers.append(zb1)
+                try:
+                    pos1 = zb1.get_position()
+                    step_mm = MICROSTEP_UM / 1000.0
+                    print(
+                        f"[Main] Zaber[0] start pos (native) = {pos1} "
+                        f"(~ {pos1 * step_mm:.3f} mm)"
+                    )
+                    zaber_start_pos_list.append(pos1)
+                except Exception as e:
+                    print(f"[Zaber[0]] get_position failed: {e}")
+                    zaber_start_pos_list.append(None)
             except Exception as e:
-                print(f"[Zaber] get_position failed: {e}")
-                zaber_start_pos = None
-        except Exception as e:
-            print(f"[Zaber] Init failed: {e}")
-            zaber = None
+                print(f"[Zaber[0]] Init failed on port {PORT_ZABER_1}: {e}")
+
+        # 2번 Zaber
+        if PORT_ZABER_2:
+            try:
+                zb2 = ZaberStage(PORT_ZABER_2)
+                zabers.append(zb2)
+                try:
+                    pos2 = zb2.get_position()
+                    step_mm = MICROSTEP_UM / 1000.0
+                    print(
+                        f"[Main] Zaber[1] start pos (native) = {pos2} "
+                        f"(~ {pos2 * step_mm:.3f} mm)"
+                    )
+                    zaber_start_pos_list.append(pos2)
+                except Exception as e:
+                    print(f"[Zaber[1]] get_position failed: {e}")
+                    zaber_start_pos_list.append(None)
+            except Exception as e:
+                print(f"[Zaber[1]] Init failed on port {PORT_ZABER_2}: {e}")
 
     # Robotus 초기화
     rft = init_robotus()
 
-    # Zaber를 일정 속도로 움직이기 (velocity 모드)
-    if zaber is not None and ZABER_USE:
-        try:
-            zaber.move_velocity(ZABER_VEL_NATIVE)
-            print(
-                f"[Main] Zaber.move_velocity({ZABER_VEL_NATIVE}) called "
-                f"(≈ {DESIRED_SPEED_MM_S:.2f} mm/s)."
-            )
-        except Exception as e:
-            print(f"[Zaber] move_velocity failed: {e}")
+    # Zaber들을 일정 속도로 움직이기 (velocity 모드)
+    if zabers and ZABER_USE:
+        for idx, zb in enumerate(zabers):
+            try:
+                zb.move_velocity(ZABER_VEL_NATIVE)
+                print(
+                    f"[Main] Zaber[{idx}].move_velocity({ZABER_VEL_NATIVE}) called "
+                    f"(≈ {DESIRED_SPEED_MM_S:.2f} mm/s)."
+                )
+            except Exception as e:
+                print(f"[Zaber[{idx}]] move_velocity failed: {e}")
 
     # 수집 스레드 시작
     acq_thread = threading.Thread(
         target=acquisition_loop,
-        args=(rft, zaber),
+        args=(rft, zabers),
         daemon=True,
     )
     acq_thread.start()
@@ -412,25 +447,25 @@ def main():
             print("[Main] Target slope reached → auto cleanup.")
             save_and_cleanup(
                 rft,
-                zaber,
+                zabers,
                 reason="Target slope reached.",
-                zaber_start_pos=zaber_start_pos,
+                zaber_start_pos_list=zaber_start_pos_list,
             )
         else:
             print("[Main] Window closed by user → cleanup.")
             save_and_cleanup(
                 rft,
-                zaber,
+                zabers,
                 reason="Figure closed by user.",
-                zaber_start_pos=zaber_start_pos,
+                zaber_start_pos_list=zaber_start_pos_list,
             )
 
     except KeyboardInterrupt:
         save_and_cleanup(
             rft,
-            zaber,
+            zabers,
             reason="KeyboardInterrupt (Ctrl+C).",
-            zaber_start_pos=zaber_start_pos,
+            zaber_start_pos_list=zaber_start_pos_list,
         )
 
     finally:

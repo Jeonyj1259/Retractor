@@ -3,7 +3,7 @@
 Robotus F/T 센서를 고주파수(TARGET_FS)로 읽으면서
 Fz에 EMA 저역통과 필터를 적용하고,
 윈도우 기반 dFz/dt(slope)가 어떤 임계값을 넘으면
-Zaber 스테이지를 멈추고 계측을 종료하는 코드.
+Zaber 스테이지(최대 2대)를 멈추고 계측을 종료하는 코드.
 
 - 수집(acquisition): 별도 스레드에서 TARGET_FS 근처로 실행
 - 플롯(plot): FuncAnimation으로 20 Hz 정도로만 화면 업데이트
@@ -27,32 +27,34 @@ from RFT_UART import (
     commandSetFilter,
 )
 
-# zaber_control이 아직 없더라도 에러 안 나게 stub 처리
 from zaber_control import ZaberStage
 
 
 # ========= 사용자 설정 =========
-PORT_RFT   = "COM7"   # Robotus F/T 센서 포트
-PORT_ZABER = "COM8"   # Zaber 스테이지 포트
+PORT_RFT      = "COM5"   # Robotus F/T 센서 포트
+
+# ✅ Zaber 2대 포트 (둘째가 없으면 "" 로 두면 됨)
+PORT_ZABER_1  = "COM6"   # 첫 번째 Zaber
+PORT_ZABER_2  = "COM7"       # 두 번째 Zaber (없으면 빈 문자열)
 
 TARGET_FS = 1000.0    # 목표 샘플링 주파수 [Hz]
 DT = 1.0 / TARGET_FS
 
 AXIS_FOR_SLOPE = "fz"    # slope 기준 축 (지금은 Fz)
-TARGET_SLOPE   = 100.0   # [N/s] 윈도우 기반 dFz/dt 임계값 (그래프 보고 조정)
+TARGET_SLOPE   = 1000.0   # [N/s] 윈도우 기반 dFz/dt 임계값 (그래프 보고 조정)
 MIN_TIME_FOR_TRIGGER = 0.05  # 계측 시작 후 너무 초반 스파이크는 무시 [s]
 
 # EMA 필터 시간 상수 (신호 부드럽게 정도)
-TAU = 0.03  # [s] 0.02 ~ 0.05 사이에서 조정 추천 (값이 클수록 더 부드러움)
+TAU = 0.04  # [s] 0.02 ~ 0.05 사이에서 조정 추천 (값이 클수록 더 부드러움)
 
 # 윈도우 기반 slope 계산용
 WINDOW_FOR_SLOPE = 0.01  # [s] 최근 10ms 동안의 평균 기울기
 FZ_MIN_FOR_SLOPE = 0.05  # [N] 이 force 이상일 때만 slope 트리거 체크
 
 # Zaber 관련
-ZABER_USE = True       # 실험에서 Zaber 실제로 쓸 때만 True
-MICROSTEP_UM = 0.49609375  # [µm/step] 예: X-LSQ 스테이지 스펙
-DESIRED_SPEED_MM_S = -5.0    # 네가 설정하고 싶은 실제 속도 [mm/s]
+ZABER_USE = True          # 실험에서 Zaber 실제로 쓸 때만 True
+MICROSTEP_UM = 0.49609375 # [µm/step] 예: X-LSQ 스테이지 스펙
+DESIRED_SPEED_MM_S = -5.0 # 네가 설정하고 싶은 실제 속도 [mm/s]
 ZABER_VEL_NATIVE = int(DESIRED_SPEED_MM_S / (MICROSTEP_UM / 1000.0))
 # ==============================
 
@@ -119,11 +121,11 @@ def init_robotus() -> RFTseries:
     return rft
 
 
-def acquisition_loop(rft, zaber):
+def acquisition_loop(rft, zabers):
     """
     고주파수(TARGET_FS)로 Robotus에서 데이터를 읽고,
     Fz에 EMA 필터 적용 + 윈도우 기반 dFz/dt 계산 + slope 임계값 체크.
-    임계값을 넘으면 Zaber를 stop() 하고 루프 종료.
+    임계값을 넘으면 모든 Zaber를 stop() 하고 루프 종료.
     """
     global running, target_reached
 
@@ -193,17 +195,20 @@ def acquisition_loop(rft, zaber):
             and abs(fz_filt) >= FZ_MIN_FOR_SLOPE
             and slope        >= TARGET_SLOPE
         ):
-            print(f"[Acq] TARGET SLOPE REACHED: slope={slope:.2f} at t={t_rel:.4f}s (Fz_filt={fz_filt:.4f})")
+            print(
+                f"[Acq] TARGET SLOPE REACHED: slope={slope:.2f} "
+                f"at t={t_rel:.4f}s (Fz_filt={fz_filt:.4f})"
+            )
             target_reached = True
             running = False
 
-            # 👉 여기서 바로 Zaber 정지
-            if zaber is not None:
+            # 👉 여기서 바로 모든 Zaber 정지
+            for i, zb in enumerate(zabers):
                 try:
-                    zaber.stop()
-                    print("[Acq] Zaber stop() called due to slope trigger.")
+                    zb.stop()
+                    print(f"[Acq] Zaber[{i}] stop() called due to slope trigger.")
                 except Exception as e:
-                    print(f"[Acq] Zaber stop() failed: {e}")
+                    print(f"[Acq] Zaber[{i}] stop() failed: {e}")
             break
 
         # 6) 타이밍 맞추기 (고주파수 루프)
@@ -217,23 +222,23 @@ def acquisition_loop(rft, zaber):
     print("[Acq] Acquisition loop ended.")
 
 
-def save_and_cleanup(rft, zaber, reason: str = ""):
-    """센서 정지, Zaber 정지, CSV/그림 저장, 리소스 반환."""
+def save_and_cleanup(rft, zabers, reason: str = ""):
+    """센서 정지, 모든 Zaber 정지, CSV/그림 저장, 리소스 반환."""
     global running
     running = False
 
     print(f"[Cleanup] reason = {reason}")
 
     # Zaber 안전 정지 및 close
-    if zaber is not None:
+    for i, zb in enumerate(zabers):
         try:
-            zaber.stop()
+            zb.stop()
         except Exception as e:
-            print(f"[WARN] Zaber stop in cleanup failed: {e}")
+            print(f"[WARN] Zaber[{i}] stop in cleanup failed: {e}")
         try:
-            zaber.close()
+            zb.close()
         except Exception as e:
-            print(f"[WARN] Zaber close failed: {e}")
+            print(f"[WARN] Zaber[{i}] close failed: {e}")
 
     # Robotus 정지 및 close
     if rft is not None:
@@ -271,29 +276,46 @@ def save_and_cleanup(rft, zaber, reason: str = ""):
 def main():
     global running, target_reached
 
-    # Zaber 초기화
-    zaber = None
+    # Zaber 초기화 (최대 2대)
+    zabers: list[ZaberStage] = []
     if ZABER_USE:
-        try:
-            zaber = ZaberStage(PORT_ZABER)
-        except Exception as e:
-            print(f"[Zaber] Init failed: {e}")
-            zaber = None
+        # 1번 Zaber
+        if PORT_ZABER_1:
+            try:
+                zb1 = ZaberStage(PORT_ZABER_1)
+                zabers.append(zb1)
+            except Exception as e:
+                print(f"[Zaber[0]] Init failed on port {PORT_ZABER_1}: {e}")
+
+        # 2번 Zaber
+        if PORT_ZABER_2:
+            try:
+                zb2 = ZaberStage(PORT_ZABER_2)
+                zabers.append(zb2)
+            except Exception as e:
+                print(f"[Zaber[1]] Init failed on port {PORT_ZABER_2}: {e}")
 
     # Robotus 초기화
     rft = init_robotus()
 
-    # 👉 Zaber를 일정 속도로 움직이기 (native 단위, sign으로 방향 결정)
-    if zaber is not None and ZABER_USE:
-        try:
-            zaber.move_velocity(ZABER_VEL_NATIVE)
-            print(f"[Main] Zaber.move_velocity({ZABER_VEL_NATIVE}) called."
-                  f"(≈ {DESIRED_SPEED_MM_S:.2f} mm/s).")
-        except Exception as e:
-            print(f"[Zaber] move_velocity failed: {e}")
+    # 👉 Zaber들을 일정 속도로 움직이기 (native 단위, sign으로 방향 결정)
+    if zabers and ZABER_USE:
+        for i, zb in enumerate(zabers):
+            try:
+                zb.move_velocity(ZABER_VEL_NATIVE)
+                print(
+                    f"[Main] Zaber[{i}].move_velocity({ZABER_VEL_NATIVE}) called "
+                    f"(≈ {DESIRED_SPEED_MM_S:.2f} mm/s)."
+                )
+            except Exception as e:
+                print(f"[Zaber[{i}]] move_velocity failed: {e}")
 
     # 수집 스레드 시작
-    acq_thread = threading.Thread(target=acquisition_loop, args=(rft, zaber), daemon=True)
+    acq_thread = threading.Thread(
+        target=acquisition_loop,
+        args=(rft, zabers),
+        daemon=True
+    )
     acq_thread.start()
 
     # ==== 플롯 설정 (Fz raw, filtered, slope) ====
@@ -316,10 +338,10 @@ def main():
 
     def update_plot(frame):
         with data_lock:
-            t = list(time_data)
-            fz_raw = list(fz_data)
+            t       = list(time_data)
+            fz_raw  = list(fz_data)
             fz_filt = list(fz_filt_data)
-            slope = list(slope_data)
+            slope   = list(slope_data)
 
         if len(t) == 0:
             return line_fz_raw, line_fz_filt, line_slope
@@ -350,13 +372,13 @@ def main():
 
         if target_reached:
             print("[Main] Target slope reached → auto cleanup.")
-            save_and_cleanup(rft, zaber, reason="Target slope reached.")
+            save_and_cleanup(rft, zabers, reason="Target slope reached.")
         else:
             print("[Main] Window closed by user → cleanup.")
-            save_and_cleanup(rft, zaber, reason="Figure closed by user.")
+            save_and_cleanup(rft, zabers, reason="Figure closed by user.")
 
     except KeyboardInterrupt:
-        save_and_cleanup(rft, zaber, reason="KeyboardInterrupt (Ctrl+C).")
+        save_and_cleanup(rft, zabers, reason="KeyboardInterrupt (Ctrl+C).")
 
     finally:
         if plt.fignum_exists(fig.number):
